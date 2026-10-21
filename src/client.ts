@@ -1,15 +1,18 @@
 import * as fs from "fs";
-import * as os from "os";
-import * as path from "path";
 import { load as cheerioLoad } from "cheerio";
 import type { BrowserContext } from "playwright";
 import { chromium } from "playwright";
 
-export interface ClientConfig {
-  school: string;
-  username: string;
-  password: string;
-}
+import { loginWithContext, tryFastLogin } from "./auth/index.js";
+import type { ClientConfig } from "./auth/types.js";
+import {
+  clearSessionStorage,
+  loadSessionStorage,
+  profileDir,
+  profileDirPath,
+} from "./session-storage.js";
+
+export type { ClientConfig } from "./auth/types.js";
 
 // ── Persistent browser context (one per process, kept alive) ─────────────────
 // The portal (edookit.net) binds PHPSESSID to the TLS client fingerprint.
@@ -19,120 +22,6 @@ export interface ClientConfig {
 
 let _ctx: BrowserContext | null = null;
 let _ctxSchool: string | null = null;
-
-function profileDir(school: string): string {
-  const dir = path.join(os.homedir(), ".cache", "edookit-legacy-mcp", `profile-${school}`);
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  return dir;
-}
-
-// ── Plus4U OIDC session storage helpers ──────────────────────────────────────
-// After a successful Playwright form-login the Plus4U OIDC SDK keeps the
-// session (id_token + refresh_token) in the page's sessionStorage.  We persist
-// it to disk so that the next startup can inject it back via addInitScript()
-// before the OIDC SDK runs — letting Plus4U do a silent prompt=none re-auth
-// instead of showing the credential form again.
-
-const SESSION_STORAGE_FILE = "session-storage.json";
-
-function sessionStoragePath(school: string): string {
-  return path.join(profileDir(school), SESSION_STORAGE_FILE);
-}
-
-function loadSessionStorage(school: string): Record<string, string> | null {
-  const p = sessionStoragePath(school);
-  try {
-    if (!fs.existsSync(p)) return null;
-    const raw = fs.readFileSync(p, "utf8");
-    const obj = JSON.parse(raw);
-    if (typeof obj !== "object" || obj === null || Array.isArray(obj)) return null;
-    return obj as Record<string, string>;
-  } catch {
-    return null;
-  }
-}
-
-async function saveSessionStorage(page: import("playwright").Page, school: string): Promise<void> {
-  try {
-    const storage = await page.evaluate((): Record<string, string> => {
-      const items: Record<string, string> = {};
-      for (let i = 0; i < sessionStorage.length; i++) {
-        const key = sessionStorage.key(i);
-        if (key) items[key] = sessionStorage.getItem(key) ?? "";
-      }
-      return items;
-    });
-    if (Object.keys(storage).length > 0) {
-      fs.writeFileSync(sessionStoragePath(school), JSON.stringify(storage, null, 2), { mode: 0o600 });
-      process.stderr.write("[edookit-portal] Saved Plus4U OIDC session storage for fast re-auth.\n");
-    }
-  } catch {
-    // Non-critical — ignore
-  }
-}
-
-function clearSessionStorage(school: string): void {
-  try { fs.rmSync(sessionStoragePath(school), { force: true }); } catch { /* ignore */ }
-}
-
-/**
- * Attempt a fast (no-form) login by injecting saved Plus4U OIDC session
- * storage into the page before it loads, then letting the SDK do a silent
- * prompt=none callback.  Returns true if edookit auth cookies appeared.
- */
-async function tryFastLogin(
-  ctx: BrowserContext,
-  cfg: ClientConfig,
-  savedStorage: Record<string, string>,
-): Promise<boolean> {
-  const baseUrl = `https://${cfg.school}.edookit.net`;
-  const page = await ctx.newPage();
-  try {
-    // Inject saved sessionStorage before any page JS runs (addInitScript fires
-    // in the page context before the first script tag executes).
-    await page.addInitScript((storage: Record<string, string>) => {
-      try {
-        Object.entries(storage).forEach(([k, v]) => sessionStorage.setItem(k, v));
-      } catch { /* sandboxed context */ }
-    }, savedStorage);
-
-    // Do NOT strip prompt=none this time — we WANT the silent re-auth to work.
-    await page.goto(`${baseUrl}/user/login`, {
-      waitUntil: "domcontentloaded",
-      timeout: 25_000,
-    }).catch(() => {});
-
-    // Wait up to 20 s for auth cookies (prompt=none is fast when it works)
-    const deadline = Date.now() + 20_000;
-    while (Date.now() < deadline) {
-      const cookies = await ctx.cookies(baseUrl);
-      if (cookies.some((c) => c.name === "X-EdooAuthToken" || c.name === "X-Auth-Id")) {
-        // Confirm session by navigating to a real page
-        try {
-          await page.goto(`${baseUrl}/overview/updates`, {
-            waitUntil: "domcontentloaded",
-            timeout: 15_000,
-          });
-          await page.waitForFunction(
-            (lp: string) => !window.location.href.includes(lp),
-            "/user/login",
-            { timeout: 6_000 }
-          ).catch(() => {});
-        } catch { /* best-effort */ }
-        process.stderr.write("[edookit-portal] Fast re-auth succeeded (Plus4U prompt=none).\n");
-        // Refresh the saved session storage after a successful fast re-auth
-        await saveSessionStorage(page, cfg.school);
-        return true;
-      }
-      await page.waitForTimeout(300);
-    }
-    return false;
-  } catch {
-    return false;
-  } finally {
-    try { await page.close(); } catch { /* ignore */ }
-  }
-}
 
 async function getContext(cfg: ClientConfig): Promise<BrowserContext> {
   if (_ctx && _ctxSchool === cfg.school) return _ctx;
@@ -190,7 +79,7 @@ async function getContext(cfg: ClientConfig): Promise<BrowserContext> {
     // This avoids spawning a new context or wiping the profile — just clears
     // the stale edookit cookies and lets the OIDC SDK renew them.
     const savedStorage = loadSessionStorage(cfg.school);
-    if (savedStorage && cfg.username && cfg.password) {
+    if (savedStorage) {
       await ctx.clearCookies();
       const fastOk = await tryFastLogin(ctx, cfg, savedStorage);
       if (fastOk) {
@@ -221,105 +110,6 @@ async function getContext(cfg: ClientConfig): Promise<BrowserContext> {
   _ctx = ctx;
   _ctxSchool = cfg.school;
   return ctx;
-}
-
-async function loginWithContext(ctx: BrowserContext, cfg: ClientConfig): Promise<void> {
-  const baseUrl = `https://${cfg.school}.edookit.net`;
-
-  process.stderr.write("[edookit-portal] Logging in with username/password...\n");
-
-  const page = await ctx.newPage();
-
-  // Strip prompt=none so Plus4U doesn't silently skip the credential form
-  await page.route("**/*", (route) => {
-    const url = route.request().url();
-    if (url.includes("prompt=none") && url.includes("93b2c166a7aa436baa0278b8f5c736db")) {
-      route.continue({ url: url.replace("&prompt=none", "").replace("prompt=none&", "") });
-    } else {
-      route.continue();
-    }
-  });
-
-  try {
-    await page.goto(`${baseUrl}/user/login`);
-
-    // Wait for either the login form OR auth cookies (silent SSO may skip the form)
-    await Promise.race([
-      page.waitForSelector('input[name="username"]', { timeout: 20_000 }),
-      (async () => {
-        const deadline = Date.now() + 20_000;
-        while (Date.now() < deadline) {
-          const cookies = await ctx.cookies(baseUrl);
-          if (cookies.some((c) => c.name === "X-EdooAuthToken" || c.name === "X-Auth-Id")) return;
-          await page.waitForTimeout(200);
-        }
-      })(),
-    ]);
-
-    // Check if already authenticated via silent SSO
-    const earlyCheck = await ctx.cookies(baseUrl);
-    if (!earlyCheck.some((c) => c.name === "X-EdooAuthToken" || c.name === "X-Auth-Id")) {
-      // Form is visible — fill credentials
-      await page.fill('input[name="username"]', cfg.username);
-      await page.locator("button.uuelements-1gc3md2").first().click({ force: true });
-      await page.waitForSelector('input[name="password"]', { timeout: 15_000 });
-      await page.fill('input[name="password"]', cfg.password);
-      await page.evaluate(() => {
-        const s = document.querySelector<HTMLInputElement>('input[type="submit"]');
-        if (s) s.click();
-      });
-      process.stderr.write("[edookit-portal] Credentials submitted, waiting for session...\n");
-    } else {
-      process.stderr.write("[edookit-portal] Silent SSO detected — forcing credential form...\n");
-      // Silent SSO happened but we need a fresh credential-bound session.
-      // Navigate to logout to kill the SSO session, then retry login.
-      try { await page.goto(`${baseUrl}/user/logout`, { timeout: 10_000 }); } catch { /* ignore */ }
-      await page.goto(`${baseUrl}/user/login`);
-      await page.waitForSelector('input[name="username"]', { timeout: 20_000 });
-      await page.fill('input[name="username"]', cfg.username);
-      await page.locator("button.uuelements-1gc3md2").first().click({ force: true });
-      await page.waitForSelector('input[name="password"]', { timeout: 15_000 });
-      await page.fill('input[name="password"]', cfg.password);
-      await page.evaluate(() => {
-        const s = document.querySelector<HTMLInputElement>('input[type="submit"]');
-        if (s) s.click();
-      });
-      process.stderr.write("[edookit-portal] Credentials submitted after SSO bypass, waiting...\n");
-    }
-
-    // Wait for auth cookies
-    const timeout = 30_000;
-    const deadline = Date.now() + timeout;
-
-    while (Date.now() < deadline) {
-      const cookies = await ctx.cookies(baseUrl);
-      if (cookies.some((c) => c.name === "X-EdooAuthToken" || c.name === "X-Auth-Id")) {
-        // Navigate to confirm the full OIDC callback and get a bound PHPSESSID
-        process.stderr.write("[edookit-portal] Auth cookies found, confirming session...\n");
-        try {
-          await page.goto(`${baseUrl}/overview/updates`, { waitUntil: "domcontentloaded", timeout: 15_000 });
-          // Wait for OIDC redirects to fully settle
-          await page.waitForFunction(
-            (loginPath: string) => !window.location.href.includes(loginPath),
-            "/user/login",
-            { timeout: 8_000 }
-          ).catch(() => { /* best-effort — if still on login, portalFetch will re-auth */ });
-        } catch {
-          // best-effort
-        }
-        process.stderr.write("[edookit-portal] Authentication successful.\n");
-        await saveSessionStorage(page, cfg.school);
-        await page.close();
-        return;
-      }
-      await page.waitForTimeout(300);
-    }
-
-    throw new Error("Login timed out. Check EDOOKIT_USERNAME and EDOOKIT_PASSWORD.");
-  } catch (err) {
-    try { await page.close(); } catch { /* ignore */ }
-    throw err;
-  }
 }
 
 // ── HTTP client (via Playwright browser context) ──────────────────────────────
@@ -448,12 +238,14 @@ export async function portalFetch(
     try { await _ctx?.close(); } catch { /* ignore */ }
     _ctx = null;
     _ctxSchool = null;
-    fs.rmSync(profileDir(cfg.school), { recursive: true, force: true });
+    fs.rmSync(profileDirPath(cfg.school), { recursive: true, force: true });
 
     const freshCtx = await getContext(cfg);
     const freshResult = await makeRequest(freshCtx)(url);
     if (freshResult.finalUrl.includes("/user/login")) {
-      throw new Error("Authentication failed. Check EDOOKIT_USERNAME and EDOOKIT_PASSWORD.");
+      throw new Error(
+        "Authentication failed after re-login. Check the credentials for the configured Edookit auth method."
+      );
     }
     return freshResult;
   }
@@ -487,7 +279,6 @@ export function invalidateSession(school: string) {
     _ctx = null;
     _ctxSchool = null;
   }
-  const dir = path.join(os.homedir(), ".cache", "edookit-legacy-mcp", `profile-${school}`);
-  try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  try { fs.rmSync(profileDirPath(school), { recursive: true, force: true }); } catch { /* ignore */ }
   clearSessionStorage(school);
 }

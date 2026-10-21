@@ -1,32 +1,40 @@
+import { loadClientConfig } from "./auth/config.js";
+import { resolveAuthMethod } from "./auth/methods.js";
 import { portalFetch, portalAjax, parseHtml, type ClientConfig } from "./client.js";
 
 // ── helpers ────────────────────────────────────────────────────────────────
 
 function cfg(): ClientConfig {
-  const school = process.env.EDOOKIT_SCHOOL;
-  const username = process.env.EDOOKIT_USERNAME;
-  const password = process.env.EDOOKIT_PASSWORD;
-  if (!school) throw new Error("Missing env var: EDOOKIT_SCHOOL");
-  if (!username) throw new Error("Missing env var: EDOOKIT_USERNAME");
-  if (!password) throw new Error("Missing env var: EDOOKIT_PASSWORD");
-  return { school, username, password };
+  const config = loadClientConfig();
+  // Fail before launching a browser if the selected method lacks credentials.
+  resolveAuthMethod(config);
+  return config;
 }
 
 async function getPage(path: string) {
   const { body, finalUrl } = await portalFetch(cfg(), path);
   if (finalUrl.includes("/user/login") || finalUrl.includes("user/oidc")) {
-    throw new Error("Authentication failed. Check EDOOKIT_USERNAME and EDOOKIT_PASSWORD.");
+    throw new Error("Authentication failed. Check the credentials for the configured Edookit auth method.");
   }
   return body;
 }
 
 // ── tool implementations ───────────────────────────────────────────────────
 
-export async function getDashboard() {
-  const html = await getPage("/");
+export function parseDashboard(html: string) {
   const $ = parseHtml(html);
 
-  const student = $(".student-name, .user-name").first().text().trim() || "Unknown";
+  const student =
+    $(".student-container .student .name").first().text().trim() ||
+    $(".student-name, .user-name").first().text().trim() ||
+    "Unknown";
+  const students = $(".student-container .student")
+    .map((_, el) => ({
+      name: $(el).find(".name").text().trim(),
+      class: $(el).find(".class").text().trim(),
+    }))
+    .get()
+    .filter((s) => s.name);
 
   // Timetable blocks (current week mini-view on dashboard)
   const timetableItems: string[] = [];
@@ -57,11 +65,16 @@ export async function getDashboard() {
 
   return {
     student,
+    students,
     pinnedItems: pinned,
     attendanceThisWeek: attendance,
     timetableHighlights: timetableItems.slice(0, 10),
     unreadCounts: unread,
   };
+}
+
+export async function getDashboard() {
+  return parseDashboard(await getPage("/"));
 }
 
 export async function getInbox(args: { filter?: "all" | "unread" | "messages" | "events" }) {
